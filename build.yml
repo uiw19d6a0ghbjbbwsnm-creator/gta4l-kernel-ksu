@@ -1,0 +1,109 @@
+name: Build gta4l kernel (SukiSU, no /proc/config.gz)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CC: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            bc bison flex libssl-dev make git curl zip python3 cpio rsync
+
+      - name: Show toolchain versions
+        run: |
+          aarch64-linux-gnu-gcc --version | head -1
+          make --version | head -1
+
+      - name: Clone kernel source (LineageOS sm6115, lineage-23.2)
+        run: |
+          git clone --depth=1 -b lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_samsung_sm6115.git kernel
+          cd kernel
+          echo "--- base version ---"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+      - name: Integrate SukiSU (builtin)
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+          echo "--- KSU dirs after setup ---"
+          ls -d KernelSU 2>/dev/null || true
+          grep -rn "CONFIG_KSU" arch/arm64/configs/vendor/bengal-perf_defconfig || echo "(no KSU entries in defconfig yet)"
+
+      - name: Generate .config from defconfig
+        working-directory: kernel
+        run: |
+          make O=out vendor/bengal-perf_defconfig
+          echo "--- IKCONFIG before patch ---"
+          grep -i ikconfig out/.config || echo "(none)"
+
+      - name: Disable /proc/config.gz (core change)
+        working-directory: kernel
+        run: |
+          ./scripts/config --file out/.config -d IKCONFIG_PROC
+          ./scripts/config --file out/.config -d IKCONFIG
+          make O=out olddefconfig
+          echo "--- IKCONFIG after patch ---"
+          grep -i ikconfig out/.config || echo "OK: no IKCONFIG entries remain"
+
+      - name: Verify KSU config present
+        working-directory: kernel
+        run: |
+          grep -E "CONFIG_KSU(=|_)" out/.config | head -20
+
+      - name: Build vmlinux
+        working-directory: kernel
+        run: make O=out -j$(nproc) vmlinux
+
+      - name: Build Image
+        working-directory: kernel
+        run: make O=out -j$(nproc) arch/arm64/boot/Image
+
+      - name: Show build result
+        working-directory: kernel
+        run: |
+          cat out/include/config/kernel.release
+          ls -la out/arch/arm64/boot/Image
+
+      - name: Fetch AnyKernel3 scaffold
+        run: |
+          git clone --depth=1 https://github.com/KeiraOMG0/gta4lwifi_kernel_ksu.git ref
+          cp -r ref/AnyKernel3 ak3
+          rm -rf ak3/.git
+          ls -la ak3 | head -20
+
+      - name: Package AnyKernel3 zip
+        run: |
+          cp kernel/out/arch/arm64/boot/Image ak3/Image
+          cd ak3
+          rm -f ./*.zip
+          zip -r9 ../gta4l-kernel-ksu.zip . -x '.git/*' -x '.github/*'
+          cd ..
+          ls -la gta4l-kernel-ksu.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4l-kernel-ksu
+          path: |
+            gta4l-kernel-ksu.zip
+            kernel/out/arch/arm64/boot/Image
+          if-no-files-found: error
