@@ -10,34 +10,43 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
 
     env:
       ARCH: arm64
       SUBARCH: arm64
-      CROSS_COMPILE: aarch64-linux-gnu-
-      CC: aarch64-linux-gnu-gcc
 
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
+                      "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            clang lld llvm \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev make git curl zip python3 cpio rsync
+            bc bison flex libssl-dev make git curl zip python3 cpio rsync \
+            device-tree-compiler
 
       - name: Show toolchain versions
         run: |
-          aarch64-linux-gnu-gcc --version | head -1
-          make --version | head -1
+          clang --version | head -1
+          ld.lld --version | head -1
+          echo "cores: $(nproc)"
+          df -h /
 
       - name: Clone kernel source (LineageOS sm6115, lineage-23.2)
         run: |
           git clone --depth=1 -b lineage-23.2 \
             https://github.com/LineageOS/android_kernel_samsung_sm6115.git kernel
           cd kernel
-          echo "--- base version ---"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
 
       - name: Integrate SukiSU (builtin)
@@ -46,42 +55,47 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
           echo "--- KSU dirs after setup ---"
           ls -d KernelSU 2>/dev/null || true
-          grep -rn "CONFIG_KSU" arch/arm64/configs/vendor/bengal-perf_defconfig || echo "(no KSU entries in defconfig yet)"
 
-      - name: Generate .config from defconfig
+      - name: Generate .config (defconfig + gta4l fragment)
         working-directory: kernel
         run: |
-          make O=out vendor/bengal-perf_defconfig
-          echo "--- IKCONFIG before patch ---"
-          grep -i ikconfig out/.config || echo "(none)"
+          make O=out LLVM=1 vendor/bengal-perf_defconfig
+          scripts/kconfig/merge_config.sh -O out \
+            out/.config arch/arm64/configs/vendor/gta4l-common.config
+          make O=out LLVM=1 olddefconfig
+          echo "--- sanity checks ---"
+          grep -c "^CONFIG_" out/.config
+          grep -E "CONFIG_GTA4L_DTB|CONFIG_SEC_BSP|CONFIG_QCA_CLD_WLAN" out/.config || true
 
       - name: Disable /proc/config.gz (core change)
         working-directory: kernel
         run: |
           ./scripts/config --file out/.config -d IKCONFIG_PROC
           ./scripts/config --file out/.config -d IKCONFIG
-          make O=out olddefconfig
+          make O=out LLVM=1 olddefconfig
           echo "--- IKCONFIG after patch ---"
           grep -i ikconfig out/.config || echo "OK: no IKCONFIG entries remain"
 
       - name: Verify KSU config present
         working-directory: kernel
         run: |
-          grep -E "CONFIG_KSU(=|_)" out/.config | head -20
+          grep -E "CONFIG_KSU" out/.config | head -20 || echo "(no CONFIG_KSU entries!)"
 
       - name: Build vmlinux
         working-directory: kernel
-        run: make O=out -j$(nproc) vmlinux
+        run: make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) vmlinux 2>&1 | tail -250
 
       - name: Build Image
         working-directory: kernel
-        run: make O=out -j$(nproc) arch/arm64/boot/Image
+        run: |
+          make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) arch/arm64/boot/Image 2>&1 | tail -120
+          ls -la out/arch/arm64/boot/
 
       - name: Show build result
         working-directory: kernel
         run: |
           cat out/include/config/kernel.release
-          ls -la out/arch/arm64/boot/Image
+          ls -la out/arch/arm64/boot/Image*
 
       - name: Fetch AnyKernel3 scaffold
         run: |
