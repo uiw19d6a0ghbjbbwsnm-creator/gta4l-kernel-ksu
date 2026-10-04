@@ -96,7 +96,13 @@ jobs:
           set -o pipefail
           df -h /
           RC=0
-          make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) 2>&1 | tee /tmp/build.log || RC=$?
+          # NOTE: build "Image" explicitly, NOT the default target.
+          # The default target (all) pulls in "dtbs", and the in-tree dtc crashes
+          # (SIGABRT / Error 134) on arch/arm64/boot/dts/vendor/qcom/P85946-qrd-overlay.dtbo.
+          # LineageOS works around it by overriding DTC with a prebuilt binary.
+          # We don't need the DTB at all: the AnyKernel3 zip keeps the existing
+          # boot image's dtb and only swaps the kernel Image.
+          make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 | tee /tmp/build.log || RC=$?
           echo ""
           echo "########## BUILD EXIT CODE: $RC ##########"
           echo ""
