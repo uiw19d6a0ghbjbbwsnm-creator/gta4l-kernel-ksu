@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -20,6 +24,7 @@ jobs:
     steps:
       - name: Free disk space
         run: |
+          set -o pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
                       "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
@@ -28,6 +33,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          set -o pipefail
           sudo apt-get update
           sudo apt-get install -y \
             clang lld llvm \
@@ -37,6 +43,7 @@ jobs:
 
       - name: Show toolchain versions
         run: |
+          set -o pipefail
           clang --version | head -1
           ld.lld --version | head -1
           echo "cores: $(nproc)"
@@ -44,6 +51,7 @@ jobs:
 
       - name: Clone kernel source (LineageOS sm6115, lineage-23.2)
         run: |
+          set -o pipefail
           git clone --depth=1 -b lineage-23.2 \
             https://github.com/LineageOS/android_kernel_samsung_sm6115.git kernel
           cd kernel
@@ -52,13 +60,16 @@ jobs:
       - name: Integrate SukiSU (builtin)
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+          set -o pipefail
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash
           echo "--- KSU dirs after setup ---"
           ls -d KernelSU 2>/dev/null || true
+          grep -n "kernelsu" drivers/Makefile || true
 
       - name: Generate .config (defconfig + gta4l fragment)
         working-directory: kernel
         run: |
+          set -o pipefail
           make O=out LLVM=1 vendor/bengal-perf_defconfig
           scripts/kconfig/merge_config.sh -O out \
             out/.config arch/arm64/configs/vendor/gta4l-common.config
@@ -66,58 +77,81 @@ jobs:
           echo "--- sanity checks ---"
           grep -c "^CONFIG_" out/.config
           grep -E "CONFIG_GTA4L_DTB|CONFIG_SEC_BSP|CONFIG_QCA_CLD_WLAN" out/.config || true
+          echo "--- KSU config ---"
+          grep -E "CONFIG_KSU" out/.config || echo "(no CONFIG_KSU!)"
 
       - name: Disable /proc/config.gz (core change)
         working-directory: kernel
         run: |
+          set -o pipefail
           ./scripts/config --file out/.config -d IKCONFIG_PROC
           ./scripts/config --file out/.config -d IKCONFIG
           make O=out LLVM=1 olddefconfig
           echo "--- IKCONFIG after patch ---"
           grep -i ikconfig out/.config || echo "OK: no IKCONFIG entries remain"
 
-      - name: Verify KSU config present
+      - name: Build kernel (log captured, errors extracted)
         working-directory: kernel
         run: |
-          grep -E "CONFIG_KSU" out/.config | head -20 || echo "(no CONFIG_KSU entries!)"
+          set -o pipefail
+          df -h /
+          RC=0
+          make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) 2>&1 | tee /tmp/build.log || RC=$?
+          echo ""
+          echo "########## BUILD EXIT CODE: $RC ##########"
+          echo ""
+          echo "########## FIRST ERRORS ##########"
+          grep -nE "error:|fatal error|Error [0-9]+|No such file|undefined reference" /tmp/build.log | head -60 || true
+          echo ""
+          echo "########## LAST 60 LINES ##########"
+          tail -60 /tmp/build.log || true
+          echo ""
+          echo "########## BOOT DIR ##########"
+          ls -la out/arch/arm64/boot/ 2>&1 || true
+          exit $RC
 
-      - name: Build vmlinux
-        working-directory: kernel
-        run: make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) vmlinux 2>&1 | tail -250
-
-      - name: Build Image
-        working-directory: kernel
-        run: |
-          make O=out LLVM=1 LLVM_IAS=1 -j$(nproc) arch/arm64/boot/Image 2>&1 | tail -120
-          ls -la out/arch/arm64/boot/
-
-      - name: Show build result
-        working-directory: kernel
-        run: |
-          cat out/include/config/kernel.release
-          ls -la out/arch/arm64/boot/Image*
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: warn
 
       - name: Fetch AnyKernel3 scaffold
+        if: success()
         run: |
+          set -o pipefail
           git clone --depth=1 https://github.com/KeiraOMG0/gta4lwifi_kernel_ksu.git ref
           cp -r ref/AnyKernel3 ak3
           rm -rf ak3/.git
-          ls -la ak3 | head -20
+          ls -la ak3
 
       - name: Package AnyKernel3 zip
+        if: success()
         run: |
-          cp kernel/out/arch/arm64/boot/Image ak3/Image
+          set -eo pipefail
+          BOOTDIR=kernel/out/arch/arm64/boot
+          IMG=""
+          for f in Image Image.gz Image.gz-dtb Image-dtb; do
+            if [ -f "$BOOTDIR/$f" ]; then IMG="$BOOTDIR/$f"; break; fi
+          done
+          echo "picked kernel image: $IMG"
+          test -n "$IMG"
+          cp "$IMG" ak3/Image
+          ls -la ak3/Image
           cd ak3
           rm -f ./*.zip
           zip -r9 ../gta4l-kernel-ksu.zip . -x '.git/*' -x '.github/*'
           cd ..
           ls -la gta4l-kernel-ksu.zip
 
-      - name: Upload artifacts
+      - name: Upload kernel artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: gta4l-kernel-ksu
           path: |
             gta4l-kernel-ksu.zip
-            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/
           if-no-files-found: error
